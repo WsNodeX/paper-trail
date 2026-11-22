@@ -1,0 +1,150 @@
+PaperTrail 第九轮｜给 Qoder 的指令（整段粘贴）
+================================================================
+
+【起点】第八轮部署已成功，线上六个文件字节与本地完全一致：
+  views.js 86007 / store.js 5454 / parser.js 14440 / app.js 28212
+  engine.js 50615 / style.css 57014
+第八轮四项改动（chip 放大 30px + aria-label / 指纹去重 / 混合徽标 /
+三内页 h1）线上全部实测通过；回归项（摘要共 5 条、单一来源 ×5、
+演示四步 3/4、375 行动作条 static、三档宽度矩阵）也全绿。
+
+这一轮只修一条真问题 —— 上一轮那个 @media (pointer: coarse) 写坏了，
+在电脑浏览器上完全不生效。
+
+================================================================
+第 0 步｜把失效证据先复现出来（改之前必须看到红色）
+================================================================
+现状：web/assets/style.css:749-755
+    /* 稀疏按钮用伪元素外扩命中区（仅触屏） */
+    @media (pointer: coarse) {
+      .tab, .btn-sm, .rel-expand, .rel-expand button { position: relative; }
+      .tab::after, .btn-sm::after, .rel-expand::after, .rel-expand button::after {
+        content: ""; position: absolute; inset: -8px -6px; min-width: 44px; min-height: 44px;
+      }
+    }
+
+问题：pointer: coarse 只匹配「主输入设备是手指」的设备。
+电脑浏览器（哪怕窗口拉到 700px 宽）、Windows 触屏笔记本、
+Chrome DevTools 的手机模拟，主指针都是 mouse → 命中 false。
+实测三档宽度（1440 / 820 / 700）下：
+    matchMedia('(pointer: coarse)') === false
+    .tab 高度 40px、::after 的 content === "none"、min-height 0px
+    .btn-sm 高度 36px、::after 同样为空
+也就是说这段 CSS 从来没生效过，等于上一轮第 1 步的「稀疏按钮外扩」
+白写了，五个 tab、六个「返回首页」、展开/收起、重置筛选仍然是 36–40px。
+
+复现步骤（在浏览器控制台跑，把输出贴回来）：
+    matchMedia('(pointer: coarse)').matches      // 桌面：false
+    matchMedia('(any-pointer: coarse)').matches  // 桌面触屏本：true
+    getComputedStyle(document.querySelector('.tab'), '::after').content  // "none"
+
+================================================================
+第 1 步｜把触屏判断改成宽度断点
+================================================================
+理由：我们真正想覆盖的是「屏幕窄 = 很可能在用手点」，
+而不是「这台机器的主指针是不是手指」。宽度断点不依赖设备探测，
+桌面拉窄窗口、DevTools 模拟、真机预览三种场景全都命中。
+
+把 style.css:749-755 整段替换为：
+
+    /* 窄屏下把小按钮的命中区撑到 44×44（不依赖设备指针类型） */
+    @media (max-width: 820px) {
+      .tab, .btn-sm, .rel-expand, .rel-expand button { position: relative; }
+      .tab::after, .btn-sm::after, .rel-expand::after, .rel-expand button::after {
+        content: ""; position: absolute; inset: -8px -6px;
+        min-width: 44px; min-height: 44px;
+      }
+    }
+
+注意三点（都是踩过的坑）：
+  1. 伪元素会盖住相邻元素，所以外扩只给稀疏按钮用。
+     已经放大到 30px 的 .chip / .src-chip 不要再加伪元素，
+     它们走的是上面 744-748 行的真放大，两套规则不要混。
+  2. .rel-expand 本身是容器，给它 position: relative 会让里面的
+     button 的 ::after 以容器为参照，可能撑出空白块。
+     改成只给 button 加，.rel-expand 那一份删掉：
+        @media (max-width: 820px) {
+          .tab, .btn-sm, .rel-expand button { position: relative; }
+          .tab::after, .btn-sm::after, .rel-expand button::after {
+            content: ""; position: absolute; inset: -8px -6px;
+            min-width: 44px; min-height: 44px;
+          }
+        }
+  3. 顶层 .tabs 是 overflow-x: auto 的横滚容器，伪元素超出左边缘时
+     会被裁掉。所以第一个 tab 的左外扩要收回：
+        .tabs .tab:first-child::after { left: 0; }
+
+================================================================
+第 2 步｜改完立刻验（三条自查，数字贴回来）
+================================================================
+在 700px 宽窗口（桌面浏览器，不是手机模拟）下控制台执行：
+
+    getComputedStyle(document.querySelector('.tab'), '::after').content
+      → 期望 ""
+
+    (() => { const t = document.querySelector('.tab'); const r = t.getBoundingClientRect();
+             const e = document.elementFromPoint(r.left + r.width/2, r.top - 6);
+             return e === t || t.contains(e); })()
+      → 期望 true（说明向上 6px 仍命中同一个 tab）
+
+    (() => { const b = document.querySelector('.btn-sm'); const r = b.getBoundingClientRect();
+             const e = document.elementFromPoint(r.left + r.width/2, r.top - 6);
+             return e === b || b.contains(e); })()
+      → 期望 true
+
+1440px 宽下再跑一次同两条 elementFromPoint，期望 false 或 null
+（桌面大屏不该有外扩，避免误触旁边的元素）。
+
+================================================================
+第 3 步｜顺手修一个验收口径问题（不用改代码，改文档）
+================================================================
+第八轮我给你的验收项里有「矩阵页出现『混合材料』」，但实际文案是
+    「6 篇示例 + 3 篇导入 · 混在一起分析」
+里面没有「混合材料」四个字，用 /混合材料/ 去 match body 一定 false。
+以后验收改成查元素：
+    document.querySelector('.matrix-count').innerText   // "9 / 9 篇"
+    document.querySelector('.mixed-hint').innerText     // "6 篇示例 + 3 篇导入 · 混在一起分析"
+两项同时存在才算通过。这条写进 README 或你自己的工作笔记，
+别再按关键词匹配。
+
+================================================================
+第 4 步｜部署（同一站点，不要新建）
+================================================================
+用 Qoder Sites 把 web/ 重新发布到 paper-trail-4psq4mt50lx.qoder.zone，
+回报新 URL / deploymentId / releaseId / published 时间。
+
+逐文件 curl 对账（六个都要）：
+  for f in js/views.js js/store.js js/core/parser.js js/app.js \
+           js/core/engine.js assets/style.css; do
+    echo "$f live=$(curl -s https://paper-trail-4psq4mt50lx.qoder.zone/$f | wc -c)"
+  done
+数字必须等于本地 `wc -c` 的六个值。不等就重新发布。
+
+================================================================
+第 5 步｜部署后实测（每条给真实数字）
+================================================================
+A. 指针查询：1440 / 820 / 700 三档，报 matchMedia('(pointer: coarse)')
+   与 getComputedStyle('.tab','::after').minHeight 两个值。
+B. 命中区：700 宽下 .tab 与 .btn-sm 向上的 elementFromPoint 是否落在
+   自身（期望 true），1440 宽下是否落在自身（期望 false）。
+C. 视觉回归：1440 宽下 .tab 仍是 40px 高、无可见变化
+   （截 ::after 尺寸或报 .tab 的 rect），确认没有把桌面布局撑开。
+D. 回归：示例 6 篇工作包标题「核心发现 按结果变量 · 共 5 条」、
+   「单一来源」5 次、「材料仅 1 篇有效」0 次。
+E. 回归：矩阵页 .matrix-count「6 / 6 篇」、无 .mixed-hint（纯示例态）。
+F. 回归：375 宽 .wp-actionbar position static、documentElement.scrollWidth
+   等于 innerWidth（无横溢）。
+G. 回归：演示路线矩阵 1/4 → 关系页 3/4 →「✓ 四步已完成」。
+H. 回归：同一段材料连导两次，第二次 papers 数不变、toast 含「跳过」。
+
+================================================================
+第 6 步｜回报格式
+================================================================
+1. style.css 改动前后字节数 + 改动的行号范围
+2. 第 2 步三条自查的原始输出
+3. 六个文件的本地字节 vs 线上字节（两列）
+4. A–H 验收表：项目 / 实测数字 / 通过 Y-N / 未通过原因
+5. 部署四项：URL / deploymentId / releaseId / published
+6. 没验证的直接写「未验证」+ 原因
+
+只报真实数字。这一轮只有一处 CSS 改动，改完请不要顺手重构别的。

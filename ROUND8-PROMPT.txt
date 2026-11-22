@@ -1,0 +1,164 @@
+PaperTrail 第八轮｜给 Qoder 的指令（整段粘贴）
+================================================================
+
+【起点】第七轮部署已成功，线上五个文件字节数与本地完全一致：
+  views.js 85648 / app.js 27807 / engine.js 50615 / parser.js 14440 / style.css 56013
+上一轮三条 P0（摘要只列前 3 条 / 768px 矩阵裁切 / 关系页演示条缺失）已确认修复。
+这一轮做四件事：手机上点不准的小按钮 + 重复导入不去重
++ 矩阵页看不到材料来源 + 三个内页缺 h1。做完部署并逐条实测。
+
+================================================================
+第 0 步｜开工前自检（四条命令，把原始输出贴回来）
+================================================================
+在工作区根目录执行：
+
+  node --check web/js/views.js
+  node --check web/js/store.js
+  node --check web/js/core/parser.js
+  node tests/run-tests.mjs
+
+  ls -l web/js/views.js web/js/store.js web/js/core/parser.js web/assets/style.css
+
+期望：语法检查全过，测试 23/23 通过。不绿就先修到全绿，不许往下走。
+把这四个文件的字节数记下来，部署后 curl 对账用。
+
+================================================================
+第 1 步｜手机上一批按钮点不准（真实命中区小于 44×44）
+================================================================
+375 宽实测，命中区不足 44×44 的元素（按页统计数量）：
+  矩阵页：顶部 tab 7 个、矩阵标签 chip 16 个、重置筛选 1 个、返回首页 1 个
+  关系页：返回首页 6 个、展开/收起 2 个、来源 chip 3 个
+  工作包页：返回首页 6 个、来源 chip 97 个
+
+对照样式现状：
+  web/assets/style.css:90-96  .tab { padding: 9px 14px; min-height: 40px; }
+  web/assets/style.css:153-158 .chip { padding: 3px 10px; min-height: 24px; }
+  web/assets/style.css:170-176 .src-chip { padding: 2px 9px; min-height: 24px; }
+  web/assets/style.css:127 .btn-sm { padding: 7px 12px; min-height: 36px; }
+
+改法：
+  1. 矩阵标签 chip（16 个）与工作包来源 chip（97 个）数量大、排列密，
+     伪元素外扩会互相遮挡导致点错，这两处直接放大真尺寸：
+       @media (max-width: 480px) {
+         .chip, .src-chip { min-height: 30px; padding: 6px 10px; }
+       }
+     同时把容纳它们的行的 gap 从 4px 提到 6px，避免手指误触相邻元素。
+  2. 顶部 tab、返回首页、展开/收起、重置筛选这类稀疏按钮，
+     保留视觉尺寸、用伪元素外扩命中区（只在触屏生效）：
+       @media (pointer: coarse) {
+         .tab, .btn-sm, .rel-expand button { position: relative; }
+         .tab::after, .btn-sm::after, .rel-expand button::after {
+           content: ""; position: absolute; inset: -8px -6px;
+           min-width: 44px; min-height: 44px;
+         }
+       }
+  3. 来源 chip 补可读标签（现在只有编号 P1/P5，屏幕阅读器读作「P1」）：
+     在 web/js/views.js:89-90 的拼接里加
+       aria-label="查看文献 ' + esc(id) + ' 的详情"
+     title 保留「查看文献详情」。
+
+验收：375 宽下 .src-chip 与矩阵 .chip 视觉高度 ≥ 30px；
+任取一枚 chip，elementFromPoint 在它中心上下各 10px 处命中的仍是它本身。
+
+================================================================
+第 2 步｜重复导入同一批材料会变成两篇同标题文献
+================================================================
+现象（实测）：同一段材料连导两次得到
+  papers = [U1 阿 睡眠与注意力…, U2 阿 睡眠与注意力…]
+两篇标题与证据完全一致，关系页还判出「待核验：两者结果变量同为
+「课堂注意力」但 U1 的证据片段仅覆盖睡眠/入睡…」，出去的是噪音。
+
+根因：web/js/store.js:47-58 的 importPapers() 直接 base.concat(newPapers)，
+无任何去重；web/js/core/parser.js:317-320 每次把 id 从 U1 重新编号。
+
+改法：
+  1. store.js 里加指纹函数：
+       function paperSig(p) {
+         var t = String(p.title || '').replace(/\s+/g, '').toLowerCase();
+         var e = ((p.evidence && p.evidence[0] && p.evidence[0].text) || '').replace(/\s+/g, '').toLowerCase();
+         return t + '|' + e.slice(0, 60);
+       }
+  2. importPapers() 里先算已有材料的签名集合，新导入逐条比对，
+     命中则丢弃（不并入、不占编号）。
+  3. 返回值改为 { total, added, skipped }，调用方（app.js 里 parse-text
+     的处理器）按结果出 toast：
+       全跳过 → 「✓ 这批材料已经在矩阵里了，跳过 M 篇重复材料」
+       部分跳 → 「✓ 成功导入 N 篇文献，跳过 M 篇重复材料」
+       无重复 → 保持原文案「✓ 成功导入 N 篇文献，矩阵与关系已更新」
+  4. replace 模式行为不变。
+
+验收：同一段文本连导两次，第二次 papers 数不变、ids 不变、toast 含「跳过」。
+
+================================================================
+第 3 步｜矩阵页看不到「这些材料里哪些是示例」
+================================================================
+现状：工作包页有「6 示例 + 3 导入 混合材料」（web/js/views.js:826-831，
+条件 nS 与 nU 都 > 0），矩阵页完全没有。评委在矩阵页看到 9 行，
+不知道其中 6 行是示例数据。
+
+改法：
+  1. 把 views.js:826-831 那段抽成共用函数 mixedBadge(s)，非混合时返回 ''。
+  2. 矩阵页 toolbar（views.js:398-401 的 .matrix-toolbar，紧跟 .matrix-count）
+     插入 mixedBadge(s)；工作包页 .ws-stats 改用同一函数，避免两处文案漂移。
+  3. 矩阵页文案写全：「6 篇示例 + 3 篇导入 · 混在一起分析」，
+     class="mixed-hint"，375 宽换行时不要挤掉右侧的「9 / 9 篇」。
+
+验收：导入 3 篇后，矩阵页工具栏出现该徽标，同时 .matrix-count 仍显示「9 / 9 篇」。
+
+================================================================
+第 4 步｜三个内页没有 h1
+================================================================
+首页有 <h1>把一堆论文，整理成一份可追溯的证据工作包</h1>，
+但矩阵 / 关系 / 工作包三页最外层都是 <h2>（如 views.js:394 的
+'<h2>文献矩阵</h2>'），深链接进入时无障碍树里拿不到页面主标题。
+
+改法：三个内页的 <h2> 换成 <h1 class="view-title">，区块内标题层级不变。
+style.css 补：
+  .view-title { font-size: inherit; margin: 0; font-weight: inherit; }
+保证视觉零变化。
+
+验收：三个内页 document.querySelectorAll('h1').length === 1，
+文本分别是「文献矩阵」「观点关系」「综述工作包」。
+
+================================================================
+第 5 步｜部署（不做这步前面全白做）
+================================================================
+用 Qoder Sites 把 web/ 重新发布到同一站点
+（paper-trail-4psq4mt50lx.qoder.zone），不要新建站点。
+回报四项真实值：新 URL / deploymentId / releaseId / published 时间。
+
+然后逐文件 curl 对账（不是只看首页 200）：
+  curl -s https://paper-trail-4psq4mt50lx.qoder.zone/js/views.js | wc -c
+  curl -s https://paper-trail-4psq4mt50lx.qoder.zone/js/store.js | wc -c
+  curl -s https://paper-trail-4psq4mt50lx.qoder.zone/js/core/parser.js | wc -c
+  curl -s https://paper-trail-4psq4mt50lx.qoder.zone/assets/style.css | wc -c
+四个数字必须等于第 0 步记下的本地字节数。不等就重新发布，不许跳过。
+
+================================================================
+第 6 步｜部署后实测（每条给真实数字，不许写「正常」）
+================================================================
+A. 触控目标：375 宽工作包页，报 .src-chip 视觉 w×h、
+   elementFromPoint 在中心 ±10px 处是否仍命中同一 chip；
+   矩阵页报 .chip 的视觉高度。
+B. 重复导入：同一段材料连导两次，报两次的 papers 数、ids、toast 原文。
+C. 混合徽标：示例 6 + 导入 3 后，报矩阵页工具栏完整文案与 .matrix-count 文案。
+D. 无障碍：三个内页各报 h1 数量与文本。
+E. 回归：示例 6 篇工作包「核心发现 按结果变量 · 共 5 条」、
+   「单一来源」出现次数、「材料仅 1 篇有效」出现次数（必须 0）。
+F. 回归：375 宽工作包页 .wp-actionbar 仍是 position: static，
+   正文可视高度 ≥ 690px。
+G. 回归：导入模式默认值不变（追加按钮 aria-pressed="true"，
+   主按钮文案「解析并追加到现有 N 篇」），粘贴 1 篇后 papers 6→7
+   且 ids 里示例仍是 P1–P6、新导入从 U7 起。
+
+================================================================
+第 7 步｜回报格式（照抄这张表逐条填）
+================================================================
+1. 四个文件的本地字节数 vs 部署后线上字节数（两列）
+2. 语法检查与测试最后三行原始输出
+3. 第 1–4 步各改了什么（文件 + 行号 + 改前改后一句话）
+4. A–G 验收表：项目 / 实测数字 / 通过 Y-N / 未通过原因
+5. 部署四项：URL / deploymentId / releaseId / published
+6. 没跑或没验证的直接写「未验证」+ 原因
+
+只报真实结果。测试不绿不许部署。任何一项没跑就说没跑。
